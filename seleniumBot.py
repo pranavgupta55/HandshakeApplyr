@@ -4,20 +4,21 @@ import csv
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     TimeoutException, 
     NoSuchElementException,
     StaleElementReferenceException,
-    ElementClickInterceptedException
+    ElementClickInterceptedException,
+    WebDriverException
 )
 from webdriver_manager.chrome import ChromeDriverManager
 
@@ -31,31 +32,33 @@ if not os.path.exists(DATA_DIR):
 DEFAULT_CSV_NAME = "application_log.csv"
 CHROME_PROFILE = os.path.join(DATA_DIR, "chrome_profile")
 
-# Strict columns for CSV
+# LIMITS
+DAILY_LIMIT = 200 
+
 FIELDNAMES = [
     'Job ID', 'Date', 'Status', 'Requirements', 'Company', 'Title', 
     'Job Link', 'Location', 'Pay', 'Job Type'
 ]
 
+# --- LOGGING HELPER ---
+def log_debug(msg):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"\033[90m[{timestamp} DEBUG]\033[0m {msg}")
+
 # --- CSV & HISTORY ---
 
 def get_csv_filepath():
-    """Ensures we don't overwrite files with different headers."""
     default_path = os.path.join(DATA_DIR, DEFAULT_CSV_NAME)
     if not os.path.exists(default_path): return default_path
-    
     try:
         with open(default_path, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
             try:
                 headers = next(reader)
                 if headers == FIELDNAMES: return default_path
-            except StopIteration: return default_path # Empty file is fine
+            except StopIteration: return default_path 
     except: pass
-    
-    # If headers mismatch, create new file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    print(f"[INFO] Schema change detected. Creating new CSV.")
     return os.path.join(DATA_DIR, f"application_log_{timestamp}.csv")
 
 def init_csv(filepath):
@@ -75,14 +78,29 @@ def load_history(filepath):
                     if row.get('Job ID'):
                         processed.add(row['Job ID'])
         except Exception: pass
-    print(f"[INIT] Loaded history: {len(processed)} jobs.")
     return processed
+
+def count_applications_last_24h(filepath):
+    if not os.path.exists(filepath): return 0
+    count = 0
+    now = datetime.now()
+    one_day_ago = now - timedelta(hours=24)
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('Status') == 'APPLIED' and row.get('Date'):
+                    try:
+                        job_date = datetime.strptime(row['Date'], "%Y-%m-%d %H:%M:%S")
+                        if job_date > one_day_ago: count += 1
+                    except ValueError: pass
+    except Exception: pass
+    return count
 
 def log_to_csv(filepath, data):
     try:
         with open(filepath, 'a', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-            # Sanitize None -> ""
             clean = {k: (v if v is not None else "") for k, v in data.items()}
             writer.writerow(clean)
     except Exception as e:
@@ -91,114 +109,105 @@ def log_to_csv(filepath, data):
 # --- ROBUST DATA EXTRACTION ---
 
 def get_card_data(card_element):
-    """
-    Extracts high-quality data from the List Card (Left Sidebar).
-    This serves as the PRIMARY source of truth.
-    """
-    data = {
-        'Job ID': 'unknown',
-        'Company': 'Unknown',
-        'Title': 'Unknown', 
-        'Job Link': '',
-        'Location': ''
-    }
-    
+    data = {'Job ID': 'unknown', 'Company': 'Unknown', 'Title': 'Unknown', 'Job Link': '', 'Location': ''}
     try:
-        # 1. Job ID from data-hook (Most Robust)
-        # Format: data-hook="job-result-card | 10540568"
         hook = card_element.get_attribute("data-hook")
         if hook and "|" in hook:
             data['Job ID'] = hook.split("|")[1].strip()
             data['Job Link'] = f"https://app.joinhandshake.com/jobs/{data['Job ID']}"
 
-        # 2. Company Name from Image Alt or Text
-        # <img ... alt="NeuralSeek" ...>
         try:
             img = card_element.find_element(By.TAG_NAME, "img")
             data['Company'] = img.get_attribute("alt")
         except:
-            # Fallback to text parsing (Company is usually 2nd line)
             lines = card_element.text.split('\n')
             if len(lines) > 1: data['Company'] = lines[1]
 
-        # 3. Job Title
-        # Often in an aria-label or strong text
         try:
-            title_el = card_element.find_element(By.XPATH, ".//strong | .//div[contains(@class, 'sc-')]") 
-            # This xpath is generic, relying on aria-label is better if available
             link = card_element.find_element(By.TAG_NAME, "a")
             data['Title'] = link.get_attribute("aria-label") or link.text
-            if "View " in data['Title']: 
-                data['Title'] = data['Title'].replace("View ", "")
+            if "View " in data['Title']: data['Title'] = data['Title'].replace("View ", "")
         except:
             lines = card_element.text.split('\n')
             if lines: data['Title'] = lines[0]
 
-        # 4. Location (often at the bottom of card)
-        # We assume it's one of the last lines
         lines = card_element.text.split('\n')
         for line in lines[-3:]:
             if "," in line or "Remote" in line:
                 data['Location'] = line
                 break
-
-    except Exception:
-        pass # Return whatever partial data we got
-        
+    except Exception: pass 
     return data
 
-def close_modal(driver):
-    """Aggressively attempts to close any open modal."""
-    # 1. ESC Key
+def force_clear_overlays(driver):
+    """
+    Nuclear option to close modals/overlays.
+    """
+    log_debug("Forcing overlays closed...")
+    
+    # 1. Spam ESC
     try:
-        ActionChains(driver).send_keys(Keys.ESCAPE).perform()
-        time.sleep(0.5)
+        actions = ActionChains(driver)
+        actions.send_keys(Keys.ESCAPE).pause(0.2).send_keys(Keys.ESCAPE).pause(0.2).send_keys(Keys.ESCAPE).perform()
+    except: pass
+
+    # 2. Click the Body (Reset focus)
+    try:
+        driver.find_element(By.TAG_NAME, "body").click()
     except: pass
     
-    # 2. Click X button
+    # 3. JS Click on any close buttons found
     try:
         driver.execute_script("""
             let btns = document.querySelectorAll('button');
             btns.forEach(b => {
                 let label = (b.ariaLabel || '').toLowerCase();
-                if(label.includes('close') || label.includes('dismiss')) b.click();
+                let txt = (b.innerText || '').toLowerCase();
+                if(label.includes('close') || label.includes('dismiss') || txt.includes('close')) {
+                    b.click();
+                }
             });
+            // Also try to hide the modal container directly if it exists
+            let modals = document.querySelectorAll('div[data-hook="apply-modal-content"]');
+            modals.forEach(m => m.closest('div[role="dialog"]').style.display = 'none');
         """)
-        time.sleep(0.5)
     except: pass
 
+    time.sleep(1.0) # Settle time
+
 def check_modal_requirements(modal):
-    """
-    Scans the modal for complexity.
-    Returns a list of barriers (e.g. ['Cover Letter', 'Questions']).
-    Returns empty list [] if Resume Only.
-    """
     barriers = []
     text = modal.text.lower()
     
-    # Docs
     if "cover letter" in text: barriers.append("Cover Letter")
     if "transcript" in text: barriers.append("Transcript")
     if "other required documents" in text: barriers.append("Other Docs")
     
-    # Inputs
     try:
-        inputs = modal.find_elements(By.CSS_SELECTOR, "input, textarea, select")
-        for inp in inputs:
+        # Check hidden radio/checkboxes
+        all_inputs = modal.find_elements(By.TAG_NAME, "input")
+        for inp in all_inputs:
             itype = inp.get_attribute("type")
-            # Ignore harmless inputs
-            if itype in ["hidden", "submit", "button", "file"]: continue
-            
-            # Stop immediately for these
             if itype in ["radio", "checkbox"]:
                 barriers.append("Questions (Checkbox/Radio)")
                 break
-                
-            # Text inputs: Check if it's a search bar (allowed) or a question (block)
+        
+        # Check Visible Text Inputs
+        inputs = modal.find_elements(By.CSS_SELECTOR, "input, textarea, select")
+        for inp in inputs:
+            itype = inp.get_attribute("type")
             placeholder = (inp.get_attribute("placeholder") or "").lower()
             label = (inp.get_attribute("aria-label") or "").lower()
             
-            if "search" in placeholder or "filter" in placeholder: continue
+            if itype in ["hidden", "submit", "button", "file", "radio", "checkbox"]: continue
+            
+            if "search" in placeholder or "filter" in placeholder:
+                # Allow resume searches
+                if "resume" in placeholder or "resume" in label:
+                    continue
+                else:
+                    barriers.append(f"Document Selector ({placeholder})")
+                    break
             
             if inp.is_displayed():
                 barriers.append("Questions (Text)")
@@ -207,6 +216,35 @@ def check_modal_requirements(modal):
     
     return barriers
 
+def handle_resume_selection(driver, modal):
+    try:
+        resume_inputs = modal.find_elements(By.CSS_SELECTOR, "input[placeholder*='Search your resumes']")
+        for inp in resume_inputs:
+            if inp.is_displayed():
+                current_val = inp.get_attribute("value")
+                if not current_val:
+                    log_debug("Auto-selecting resume...")
+                    inp.click()
+                    time.sleep(0.5)
+                    inp.send_keys(Keys.ARROW_DOWN)
+                    inp.send_keys(Keys.ENTER)
+                    time.sleep(0.5)
+                    # Click modal title to close dropdown focus
+                    try:
+                        modal.click()
+                    except: pass
+    except: pass
+
+def verify_application_success(driver):
+    try:
+        time.sleep(1.5)
+        pane = driver.find_element(By.CSS_SELECTOR, "div[data-hook='right-content']")
+        text = pane.text.lower()
+        if "withdraw application" in text or "see application" in text or "applied" in text:
+            return True
+    except: pass
+    return False
+
 # --- MAIN BOT ---
 
 def run_bot():
@@ -214,11 +252,17 @@ def run_bot():
     init_csv(csv_path)
     history = load_history(csv_path)
     
+    applied_24h = count_applications_last_24h(csv_path)
+    print(f"\n[LIMIT] Applications in last 24h: {applied_24h} / {DAILY_LIMIT}")
+    
+    if applied_24h >= DAILY_LIMIT:
+        print("[STOP] Daily limit reached.")
+        return
+
     options = Options()
     options.add_argument(f"user-data-dir={CHROME_PROFILE}") 
     options.add_argument("--start-maximized")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    # Optimize loading
     options.page_load_strategy = 'eager' 
     
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
@@ -229,97 +273,92 @@ def run_bot():
         input("\n[PAUSE] Log in, Filter, and Press ENTER to start...")
         
         while True:
-            # 1. PAGE SETUP
-            close_modal(driver)
+            force_clear_overlays(driver)
             
-            # 2. FIND CARDS
+            # Find Cards
             try:
-                # Use the specific data-hook provided in the HTML dump
                 wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div[data-hook^='job-result-card']")))
                 cards = driver.find_elements(By.CSS_SELECTOR, "div[data-hook^='job-result-card']")
             except TimeoutException:
-                print("[INFO] No cards found. Retrying/Waiting...")
+                print("[INFO] No cards found. Retrying...")
                 time.sleep(2)
                 continue
 
-            # 3. IDENTIFY NEW JOBS (Pre-processing)
-            jobs_to_process = [] # Tuples of (index, job_id, card_element)
-            
-            print(f"\n[SCAN] Scanning {len(cards)} cards on page...")
+            jobs_to_process = [] 
+            print(f"\n[SCAN] Scanning {len(cards)} cards...")
             for i, card in enumerate(cards):
                 try:
-                    # Extract ID purely from DOM attribute (No scraping needed)
                     hook = card.get_attribute("data-hook")
                     if hook and "|" in hook:
                         job_id = hook.split("|")[1].strip()
                         if job_id not in history:
                             jobs_to_process.append(i)
-                except StaleElementReferenceException:
-                    continue
+                except StaleElementReferenceException: continue
 
-            print(f"[PLAN] Found {len(jobs_to_process)} new jobs to process.")
+            print(f"[PLAN] Processing {len(jobs_to_process)} new jobs.")
 
-            # 4. PROCESS BATCH
+            # --- PAGINATION LOGIC (Moved here for better flow) ---
             if not jobs_to_process:
-                # Pagination
-                print("[NAV] Page finished. Going to next...")
+                print("[NAV] Page finished. Attempting to click Next...")
                 try:
+                    # Scroll to bottom to ensure footer isn't blocking
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(0.5)
+
                     next_btn = driver.find_element(By.CSS_SELECTOR, "button[aria-label='next page']")
                     if not next_btn.is_enabled():
-                        print("[DONE] No more pages.")
+                        print("[DONE] End of search (Next disabled).")
                         break
                     
-                    # Scroll to button to avoid interception
                     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
                     time.sleep(0.5)
                     next_btn.click()
-                    time.sleep(4) # Allow React to fetch new list
+                    time.sleep(5) 
                     continue
-                except NoSuchElementException:
-                    print("[DONE] End of list.")
-                    break
+                except (NoSuchElementException, ElementClickInterceptedException):
+                    print("[NAV] Standard click failed. Trying forced click...")
+                    try:
+                        next_btn = driver.find_element(By.XPATH, "//button[@aria-label='next page']")
+                        driver.execute_script("arguments[0].click();", next_btn)
+                        time.sleep(5)
+                        continue
+                    except:
+                        print("[CRITICAL] Pagination broken. Refreshing page...")
+                        driver.refresh()
+                        time.sleep(5)
+                        continue
 
-            # 5. EXECUTE JOBS
+            # --- PROCESS LOOP ---
+            page_needs_reload = False
+            
             for index in jobs_to_process:
-                # Re-fetch card to avoid StaleElement
+                if applied_24h >= DAILY_LIMIT: return
+
                 try:
                     current_cards = driver.find_elements(By.CSS_SELECTOR, "div[data-hook^='job-result-card']")
                     if index >= len(current_cards): break
                     card = current_cards[index]
                     
-                    # A. EXTRACT DATA (List View)
                     data = get_card_data(card)
                     data['Date'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     
-                    # Print current status
                     print(f" -> {data['Company']} | {data['Title']}")
 
-                    # B. CLICK & SYNC
                     driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", card)
                     time.sleep(0.5)
-                    try:
-                        card.click()
-                    except ElementClickInterceptedException:
-                        driver.execute_script("arguments[0].click();", card)
+                    try: card.click()
+                    except: driver.execute_script("arguments[0].click();", card)
                     
-                    # Wait for Right Pane
-                    time.sleep(1.5) # Hard wait often safer than explicit wait for text sync in React
+                    time.sleep(1.5)
                     
-                    # Update data from Right Pane if possible (Pay, etc)
                     try:
                         pane = driver.find_element(By.CSS_SELECTOR, "div[data-hook='right-content']")
                         pane_text = pane.text
-                        
-                        # Extract Pay/Type if missing
                         if "$" in pane_text:
                             for line in pane_text.split('\n'):
-                                if "$" in line: 
-                                    data['Pay'] = line
-                                    break
-                    except: pass
+                                if "$" in line: data['Pay'] = line; break
+                    except: pane_text = ""
 
-                    # C. CHECK APPLICATION STATUS
-                    # 1. Already Applied?
                     if "Applied" in pane_text or "See application" in pane_text:
                         print(f"    [SKIP] Already Applied")
                         data['Status'] = 'Skipped'
@@ -327,25 +366,16 @@ def run_bot():
                         history.add(data['Job ID'])
                         continue
 
-                    # 2. Find Button
                     try:
                         apply_btn = pane.find_element(By.XPATH, ".//button[contains(., 'Apply')]")
                     except NoSuchElementException:
-                        # Check for external link text
-                        if "Apply externally" in pane_text:
-                            print(f"    [SAVE] External Application")
-                            data['Status'] = 'External'
-                            log_to_csv(csv_path, data)
-                            history.add(data['Job ID'])
-                            continue
-                        else:
-                            print(f"    [SKIP] No Apply Button")
-                            data['Status'] = 'No Button'
-                            log_to_csv(csv_path, data)
-                            history.add(data['Job ID'])
-                            continue
+                        status = 'External' if "Apply externally" in pane_text else 'No Button'
+                        print(f"    [SKIP] {status}")
+                        data['Status'] = status
+                        log_to_csv(csv_path, data)
+                        history.add(data['Job ID'])
+                        continue
 
-                    # 3. Check External Button
                     if "external" in apply_btn.text.lower():
                         print(f"    [SAVE] External Link")
                         data['Status'] = 'External'
@@ -353,15 +383,13 @@ def run_bot():
                         history.add(data['Job ID'])
                         continue
 
-                    # D. OPEN MODAL & SCAN
+                    # Open Modal
                     apply_btn.click()
                     
                     try:
                         modal = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "div[data-hook='apply-modal-content']")))
                         
-                        # Scan
                         barriers = check_modal_requirements(modal)
-                        
                         if barriers:
                             req_str = ", ".join(barriers)
                             print(f"    [SAVE] Complex: {req_str}")
@@ -369,43 +397,69 @@ def run_bot():
                             data['Requirements'] = req_str
                             log_to_csv(csv_path, data)
                             history.add(data['Job ID'])
-                            close_modal(driver)
+                            force_clear_overlays(driver)
                         else:
-                            # E. SUBMIT (Resume Only)
+                            handle_resume_selection(driver, modal)
+                            
                             try:
-                                submit = driver.find_element(By.XPATH, "//button[contains(text(), 'Submit')]")
+                                submit = driver.find_element(By.XPATH, "//button[contains(text(), 'Submit') or contains(text(), 'Send')]")
+                                
+                                if not submit.is_enabled():
+                                    print("    [FAIL] Submit Disabled")
+                                    data['Status'] = 'Failed'
+                                    data['Requirements'] = 'Validation Error (Disabled)'
+                                    log_to_csv(csv_path, data)
+                                    history.add(data['Job ID'])
+                                    force_clear_overlays(driver)
+                                    continue
+
                                 submit.click()
+                                time.sleep(2.0)
                                 
-                                # Wait for success (Modal closes or button disappears)
-                                wait.until(EC.staleness_of(submit))
-                                print(f"    [SUCCESS] Applied!")
-                                data['Status'] = 'APPLIED'
-                                data['Requirements'] = 'Resume Only'
+                                force_clear_overlays(driver)
+                                
+                                if verify_application_success(driver):
+                                    print(f"    [SUCCESS] Application Verified!")
+                                    data['Status'] = 'APPLIED'
+                                    data['Requirements'] = 'Resume Only'
+                                    applied_24h += 1
+                                else:
+                                    print(f"    [FAIL] Validation Error (Not Verified)")
+                                    data['Status'] = 'Failed'
+                                    data['Requirements'] = 'Validation Error'
+                                
                                 log_to_csv(csv_path, data)
                                 history.add(data['Job ID'])
-                                
-                                close_modal(driver) # Just in case
-                            except Exception as e:
-                                print(f"    [FAIL] Submit error: {str(e)[:30]}")
-                                data['Status'] = 'Failed'
-                                data['Requirements'] = 'Validation Error'
-                                log_to_csv(csv_path, data)
-                                history.add(data['Job ID'])
-                                close_modal(driver)
+
+                            except NoSuchElementException:
+                                print("    [FAIL] No Submit Button")
+                                force_clear_overlays(driver)
 
                     except TimeoutException:
                         print("    [ERR] Modal failed to load")
-                        close_modal(driver)
+                        force_clear_overlays(driver)
 
+                except ElementClickInterceptedException:
+                    print("\n[CRITICAL] Click Intercepted - Refreshing page...")
+                    data['Status'] = 'Failed'
+                    data['Requirements'] = 'Click Intercepted Loop'
+                    log_to_csv(csv_path, data)
+                    history.add(data['Job ID'])
+                    
+                    driver.refresh()
+                    time.sleep(5)
+                    page_needs_reload = True
+                    break 
                 except Exception as e:
-                    print(f"[ERR] Job Loop Error: {str(e)[:50]}")
-                    close_modal(driver)
+                    print(f"[ERR] Loop Error: {str(e)[:50]}")
+                    force_clear_overlays(driver)
                     continue
+            
+            if page_needs_reload:
+                continue
 
     except KeyboardInterrupt:
         print("\n[STOP] User stopped bot.")
-    except Exception as e:
-        print(f"\n[CRASH] {e}")
     finally:
         print(f"Data saved to: {csv_path}")
 
