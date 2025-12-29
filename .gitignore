@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
-handshake_data/
+handshake_data/*
+!handshake_data/application_log.csv
