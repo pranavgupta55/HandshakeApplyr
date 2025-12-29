@@ -2,7 +2,6 @@ import time
 import random
 import csv
 import os
-import re
 import sys
 from datetime import datetime, timedelta
 from selenium import webdriver
@@ -106,7 +105,62 @@ def log_to_csv(filepath, data):
     except Exception as e:
         print(f"[ERROR] CSV Write: {e}")
 
-# --- ROBUST DATA EXTRACTION ---
+# --- ROBUST INTERACTION ---
+
+def robust_click(driver, element):
+    """
+    Tries standard click. If blocked by overlay/modal, forces JS click.
+    Returns True if successful, False if element is stale/gone.
+    """
+    try:
+        # Try smooth scroll and click
+        driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", element)
+        time.sleep(0.3)
+        element.click()
+        return True
+    except ElementClickInterceptedException:
+        # Overlay blocking? JS Click punches through.
+        try:
+            driver.execute_script("arguments[0].click();", element)
+            return True
+        except: return False
+    except StaleElementReferenceException:
+        return False
+    except Exception:
+        # Fallback for other issues
+        try:
+            driver.execute_script("arguments[0].click();", element)
+            return True
+        except: return False
+
+def force_clear_overlays(driver):
+    """
+    Nuclear option: Deletes modal backdrops from DOM.
+    """
+    # 1. ESC Key
+    try:
+        ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+    except: pass
+    
+    # 2. JS: Find and DELETE sticky overlays/modals
+    try:
+        driver.execute_script("""
+            // Click close buttons if available
+            document.querySelectorAll('button[aria-label*="close" i], button[aria-label*="dismiss" i], button[aria-label*="Cancel application" i]').forEach(b => b.click());
+            
+            // Remove modal containers/backdrops directly
+            document.querySelectorAll('div[data-hook="apply-modal-content"]').forEach(el => {
+                let dialog = el.closest('div[role="dialog"]');
+                if(dialog) dialog.remove();
+            });
+            
+            // Remove generic overlays if they are blocking clicks
+            document.querySelectorAll('div[class*="modal-overlay"], div[class*="backdrop"]').forEach(el => el.remove());
+        """)
+    except: pass
+    time.sleep(0.5)
+
+# --- DATA EXTRACTION ---
 
 def get_card_data(card_element):
     data = {'Job ID': 'unknown', 'Company': 'Unknown', 'Title': 'Unknown', 'Job Link': '', 'Location': ''}
@@ -139,42 +193,6 @@ def get_card_data(card_element):
     except Exception: pass 
     return data
 
-def force_clear_overlays(driver):
-    """
-    Nuclear option to close modals/overlays.
-    """
-    log_debug("Forcing overlays closed...")
-    
-    # 1. Spam ESC
-    try:
-        actions = ActionChains(driver)
-        actions.send_keys(Keys.ESCAPE).pause(0.2).send_keys(Keys.ESCAPE).pause(0.2).send_keys(Keys.ESCAPE).perform()
-    except: pass
-
-    # 2. Click the Body (Reset focus)
-    try:
-        driver.find_element(By.TAG_NAME, "body").click()
-    except: pass
-    
-    # 3. JS Click on any close buttons found
-    try:
-        driver.execute_script("""
-            let btns = document.querySelectorAll('button');
-            btns.forEach(b => {
-                let label = (b.ariaLabel || '').toLowerCase();
-                let txt = (b.innerText || '').toLowerCase();
-                if(label.includes('close') || label.includes('dismiss') || txt.includes('close')) {
-                    b.click();
-                }
-            });
-            // Also try to hide the modal container directly if it exists
-            let modals = document.querySelectorAll('div[data-hook="apply-modal-content"]');
-            modals.forEach(m => m.closest('div[role="dialog"]').style.display = 'none');
-        """)
-    except: pass
-
-    time.sleep(1.0) # Settle time
-
 def check_modal_requirements(modal):
     barriers = []
     text = modal.text.lower()
@@ -201,13 +219,12 @@ def check_modal_requirements(modal):
             
             if itype in ["hidden", "submit", "button", "file", "radio", "checkbox"]: continue
             
+            # Allow resume searches
             if "search" in placeholder or "filter" in placeholder:
-                # Allow resume searches
-                if "resume" in placeholder or "resume" in label:
-                    continue
-                else:
+                if "resume" not in placeholder and "resume" not in label:
                     barriers.append(f"Document Selector ({placeholder})")
                     break
+                else: continue
             
             if inp.is_displayed():
                 barriers.append("Questions (Text)")
@@ -217,21 +234,34 @@ def check_modal_requirements(modal):
     return barriers
 
 def handle_resume_selection(driver, modal):
+    """
+    Improved: Explicitly clicks the option in the listbox.
+    """
     try:
         resume_inputs = modal.find_elements(By.CSS_SELECTOR, "input[placeholder*='Search your resumes']")
         for inp in resume_inputs:
             if inp.is_displayed():
                 current_val = inp.get_attribute("value")
                 if not current_val:
-                    log_debug("Auto-selecting resume...")
-                    inp.click()
-                    time.sleep(0.5)
-                    inp.send_keys(Keys.ARROW_DOWN)
-                    inp.send_keys(Keys.ENTER)
-                    time.sleep(0.5)
-                    # Click modal title to close dropdown focus
+                    log_debug("Selecting resume...")
+                    robust_click(driver, inp)
+                    time.sleep(0.5) # Wait for listbox to appear
+                    
+                    # Strategy 1: Find the option element
                     try:
-                        modal.click()
+                        options = driver.find_elements(By.CSS_SELECTOR, "div[role='option']")
+                        if options:
+                            robust_click(driver, options[0])
+                        else:
+                            # Strategy 2: Fallback to Arrow Down
+                            inp.send_keys(Keys.ARROW_DOWN)
+                            time.sleep(0.2)
+                            inp.send_keys(Keys.ENTER)
+                    except: 
+                        pass
+
+                    # Close dropdown focus
+                    try: modal.click()
                     except: pass
     except: pass
 
@@ -275,7 +305,6 @@ def run_bot():
         while True:
             force_clear_overlays(driver)
             
-            # Find Cards
             try:
                 wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div[data-hook^='job-result-card']")))
                 cards = driver.find_elements(By.CSS_SELECTOR, "div[data-hook^='job-result-card']")
@@ -297,38 +326,38 @@ def run_bot():
 
             print(f"[PLAN] Processing {len(jobs_to_process)} new jobs.")
 
-            # --- PAGINATION LOGIC (Moved here for better flow) ---
+            # --- PAGINATION ---
             if not jobs_to_process:
                 print("[NAV] Page finished. Attempting to click Next...")
                 try:
-                    # Scroll to bottom to ensure footer isn't blocking
-                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(0.5)
-
                     next_btn = driver.find_element(By.CSS_SELECTOR, "button[aria-label='next page']")
                     if not next_btn.is_enabled():
-                        print("[DONE] End of search (Next disabled).")
+                        print("[DONE] End.")
                         break
                     
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
-                    time.sleep(0.5)
-                    next_btn.click()
+                    if not robust_click(driver, next_btn):
+                        # Force JS click if robust failed
+                        driver.execute_script("arguments[0].click();", next_btn)
+                    
                     time.sleep(5) 
                     continue
-                except (NoSuchElementException, ElementClickInterceptedException):
-                    print("[NAV] Standard click failed. Trying forced click...")
+                except NoSuchElementException:
                     try:
-                        next_btn = driver.find_element(By.XPATH, "//button[@aria-label='next page']")
+                        # Fallback Icon Search
+                        next_btn = driver.find_element(By.XPATH, "//button[.//svg[contains(@data-icon, 'chevron-right') or contains(@class, 'next')]]")
                         driver.execute_script("arguments[0].click();", next_btn)
                         time.sleep(5)
                         continue
                     except:
-                        print("[CRITICAL] Pagination broken. Refreshing page...")
-                        driver.refresh()
-                        time.sleep(5)
-                        continue
+                        print("[DONE] No Next button found.")
+                        break
+                except Exception as e:
+                    print(f"[NAV] Pagination Error: {e}. Refreshing...")
+                    driver.refresh()
+                    time.sleep(5)
+                    continue
 
-            # --- PROCESS LOOP ---
+            # --- JOB LOOP ---
             page_needs_reload = False
             
             for index in jobs_to_process:
@@ -344,10 +373,10 @@ def run_bot():
                     
                     print(f" -> {data['Company']} | {data['Title']}")
 
-                    driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", card)
-                    time.sleep(0.5)
-                    try: card.click()
-                    except: driver.execute_script("arguments[0].click();", card)
+                    # BULLDOZER CLICK
+                    if not robust_click(driver, card):
+                        log_debug("Card click failed, skipping.")
+                        continue
                     
                     time.sleep(1.5)
                     
@@ -383,8 +412,8 @@ def run_bot():
                         history.add(data['Job ID'])
                         continue
 
-                    # Open Modal
-                    apply_btn.click()
+                    # OPEN MODAL
+                    robust_click(driver, apply_btn)
                     
                     try:
                         modal = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "div[data-hook='apply-modal-content']")))
@@ -413,7 +442,7 @@ def run_bot():
                                     force_clear_overlays(driver)
                                     continue
 
-                                submit.click()
+                                robust_click(driver, submit)
                                 time.sleep(2.0)
                                 
                                 force_clear_overlays(driver)
@@ -439,20 +468,15 @@ def run_bot():
                         print("    [ERR] Modal failed to load")
                         force_clear_overlays(driver)
 
-                except ElementClickInterceptedException:
-                    print("\n[CRITICAL] Click Intercepted - Refreshing page...")
-                    data['Status'] = 'Failed'
-                    data['Requirements'] = 'Click Intercepted Loop'
-                    log_to_csv(csv_path, data)
-                    history.add(data['Job ID'])
-                    
-                    driver.refresh()
-                    time.sleep(5)
-                    page_needs_reload = True
-                    break 
                 except Exception as e:
                     print(f"[ERR] Loop Error: {str(e)[:50]}")
                     force_clear_overlays(driver)
+                    # If catastrophic error, refresh
+                    if "stale" in str(e).lower() or "disconnected" in str(e).lower():
+                         driver.refresh()
+                         time.sleep(5)
+                         page_needs_reload = True
+                         break
                     continue
             
             if page_needs_reload:
