@@ -112,7 +112,6 @@ def robust_click(driver, element):
     Tries standard click. If blocked by overlay/modal, forces JS click.
     """
     try:
-        # Check if driver is alive first
         if not driver.current_url: return False
     except: return False
 
@@ -137,21 +136,18 @@ def robust_click(driver, element):
 def force_clear_overlays(driver):
     """
     Safer cleanup: Presses ESC and JS-clicks known 'Close' buttons.
-    Does NOT delete DOM elements anymore (was causing broken pages).
     """
-    # 1. ESC Key
     try:
         ActionChains(driver).send_keys(Keys.ESCAPE).perform()
     except: pass
     
-    # 2. JS: Click close buttons safely
     try:
         driver.execute_script("""
             let buttons = document.querySelectorAll('button');
             buttons.forEach(btn => {
                 let label = (btn.getAttribute('aria-label') || '').toLowerCase();
                 if (label.includes('close') || label.includes('dismiss') || label.includes('cancel application')) {
-                    if (btn.offsetParent !== null) { // Is visible
+                    if (btn.offsetParent !== null) { 
                         btn.click();
                     }
                 }
@@ -202,7 +198,6 @@ def check_modal_requirements(modal):
     if "other required documents" in text: barriers.append("Other Docs")
     
     try:
-        # Check hidden radio/checkboxes
         all_inputs = modal.find_elements(By.TAG_NAME, "input")
         for inp in all_inputs:
             itype = inp.get_attribute("type")
@@ -210,7 +205,6 @@ def check_modal_requirements(modal):
                 barriers.append("Questions (Checkbox/Radio)")
                 break
         
-        # Check Visible Text Inputs
         inputs = modal.find_elements(By.CSS_SELECTOR, "input, textarea, select")
         for inp in inputs:
             itype = inp.get_attribute("type")
@@ -219,7 +213,6 @@ def check_modal_requirements(modal):
             
             if itype in ["hidden", "submit", "button", "file", "radio", "checkbox"]: continue
             
-            # Allow resume searches
             if "search" in placeholder or "filter" in placeholder:
                 if "resume" not in placeholder and "resume" not in label:
                     barriers.append(f"Document Selector ({placeholder})")
@@ -242,7 +235,7 @@ def handle_resume_selection(driver, modal):
                 if not current_val:
                     log_debug("Selecting resume...")
                     robust_click(driver, inp)
-                    time.sleep(0.5) 
+                    time.sleep(1.0) # WAIT for dropdown animation
                     
                     try:
                         options = driver.find_elements(By.CSS_SELECTOR, "div[role='option']")
@@ -250,18 +243,18 @@ def handle_resume_selection(driver, modal):
                             robust_click(driver, options[0])
                         else:
                             inp.send_keys(Keys.ARROW_DOWN)
-                            time.sleep(0.2)
+                            time.sleep(0.5)
                             inp.send_keys(Keys.ENTER)
                     except: pass
 
-                    # Unfocus
-                    try: modal.click()
+                    time.sleep(0.5)
+                    try: modal.click() # Unfocus
                     except: pass
     except: pass
 
 def verify_application_success(driver):
     try:
-        time.sleep(1.5)
+        time.sleep(2.0) # Wait for success message to animate in
         pane = driver.find_element(By.CSS_SELECTOR, "div[data-hook='right-content']")
         text = pane.text.lower()
         if "withdraw application" in text or "see application" in text or "applied" in text:
@@ -343,7 +336,6 @@ def run_bot():
                         print("[CRITICAL] Browser Session Died. Stopping.")
                         break
                     
-                    # Try alternate pagination search
                     try:
                         next_btn = driver.find_element(By.XPATH, "//button[.//svg[contains(@data-icon, 'chevron-right')]]")
                         driver.execute_script("arguments[0].click();", next_btn)
@@ -360,12 +352,8 @@ def run_bot():
                 if applied_24h >= DAILY_LIMIT: return
 
                 try:
-                    # Check connection health first
-                    try:
-                        _ = driver.current_url
-                    except Exception:
-                        print("[CRITICAL] Browser closed. Stopping bot.")
-                        return
+                    try: _ = driver.current_url
+                    except Exception: return
 
                     current_cards = driver.find_elements(By.CSS_SELECTOR, "div[data-hook^='job-result-card']")
                     if index >= len(current_cards): break
@@ -376,12 +364,23 @@ def run_bot():
                     
                     print(f" -> {data['Company']} | {data['Title']}")
 
+                    # 1. CLICK CARD
                     if not robust_click(driver, card):
                         log_debug("Card click failed, skipping.")
                         continue
                     
-                    time.sleep(1.5)
+                    time.sleep(1.0) # Wait for pane content to start loading
                     
+                    # 2. FOCUS PANE (Fix for dead clicks)
+                    try:
+                        pane = driver.find_element(By.CSS_SELECTOR, "div[data-hook='right-content']")
+                        robust_click(driver, pane) # Focus click
+                        time.sleep(0.5) 
+                    except: 
+                        log_debug("Could not focus pane.")
+                        pass
+
+                    # 3. GET INFO
                     try:
                         pane = driver.find_element(By.CSS_SELECTOR, "div[data-hook='right-content']")
                         pane_text = pane.text
@@ -417,69 +416,83 @@ def run_bot():
                         consecutive_failures = 0
                         continue
 
-                    # OPEN MODAL
-                    robust_click(driver, apply_btn)
+                    # 4. OPEN MODAL (Double Tap Strategy + Delays)
+                    time.sleep(0.5) # Pre-click delay
                     
-                    try:
-                        modal = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "div[data-hook='apply-modal-content']")))
-                        consecutive_failures = 0 # Success, reset counter
-                        
-                        barriers = check_modal_requirements(modal)
-                        if barriers:
-                            req_str = ", ".join(barriers)
-                            print(f"    [SAVE] Complex: {req_str}")
-                            data['Status'] = 'Saved'
-                            data['Requirements'] = req_str
-                            log_to_csv(csv_path, data)
-                            history.add(data['Job ID'])
-                            force_clear_overlays(driver)
+                    modal_opened = False
+                    for attempt in range(2):
+                        if attempt == 0:
+                            robust_click(driver, apply_btn)
                         else:
-                            handle_resume_selection(driver, modal)
-                            
-                            try:
-                                submit = driver.find_element(By.XPATH, "//button[contains(text(), 'Submit') or contains(text(), 'Send')]")
-                                
-                                if not submit.is_enabled():
-                                    print("    [FAIL] Submit Disabled")
-                                    data['Status'] = 'Failed'
-                                    data['Requirements'] = 'Validation Error (Disabled)'
-                                    log_to_csv(csv_path, data)
-                                    history.add(data['Job ID'])
-                                    force_clear_overlays(driver)
-                                    continue
-
-                                robust_click(driver, submit)
-                                time.sleep(2.0)
-                                
-                                force_clear_overlays(driver)
-                                
-                                if verify_application_success(driver):
-                                    print(f"    [SUCCESS] Application Verified!")
-                                    data['Status'] = 'APPLIED'
-                                    data['Requirements'] = 'Resume Only'
-                                    applied_24h += 1
-                                else:
-                                    print(f"    [FAIL] Validation Error (Not Verified)")
-                                    data['Status'] = 'Failed'
-                                    data['Requirements'] = 'Validation Error'
-                                
-                                log_to_csv(csv_path, data)
-                                history.add(data['Job ID'])
-
-                            except NoSuchElementException:
-                                print("    [FAIL] No Submit Button")
-                                force_clear_overlays(driver)
-
-                    except TimeoutException:
+                            log_debug("Retrying Apply click...")
+                            driver.execute_script("arguments[0].click();", apply_btn)
+                        
+                        try:
+                            modal = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "div[data-hook='apply-modal-content']")))
+                            modal_opened = True
+                            time.sleep(1.0) # Wait for modal animation to settle
+                            break
+                        except TimeoutException:
+                            pass
+                    
+                    if not modal_opened:
                         print("    [ERR] Modal failed to load")
                         consecutive_failures += 1
                         force_clear_overlays(driver)
-                        
                         if consecutive_failures >= 3:
                             print("[WARN] 3 consecutive modal failures. Refreshing page...")
                             page_needs_reload = True
                             consecutive_failures = 0
                             break
+                        continue
+
+                    consecutive_failures = 0 # Success
+                    
+                    barriers = check_modal_requirements(modal)
+                    if barriers:
+                        req_str = ", ".join(barriers)
+                        print(f"    [SAVE] Complex: {req_str}")
+                        data['Status'] = 'Saved'
+                        data['Requirements'] = req_str
+                        log_to_csv(csv_path, data)
+                        history.add(data['Job ID'])
+                        force_clear_overlays(driver)
+                    else:
+                        handle_resume_selection(driver, modal)
+                        
+                        try:
+                            submit = driver.find_element(By.XPATH, "//button[contains(text(), 'Submit') or contains(text(), 'Send')]")
+                            
+                            if not submit.is_enabled():
+                                print("    [FAIL] Submit Disabled")
+                                data['Status'] = 'Failed'
+                                data['Requirements'] = 'Validation Error (Disabled)'
+                                log_to_csv(csv_path, data)
+                                history.add(data['Job ID'])
+                                force_clear_overlays(driver)
+                                continue
+
+                            robust_click(driver, submit)
+                            time.sleep(2.0) # Wait for network request
+                            
+                            force_clear_overlays(driver)
+                            
+                            if verify_application_success(driver):
+                                print(f"    [SUCCESS] Application Verified!")
+                                data['Status'] = 'APPLIED'
+                                data['Requirements'] = 'Resume Only'
+                                applied_24h += 1
+                            else:
+                                print(f"    [FAIL] Validation Error (Not Verified)")
+                                data['Status'] = 'Failed'
+                                data['Requirements'] = 'Validation Error'
+                            
+                            log_to_csv(csv_path, data)
+                            history.add(data['Job ID'])
+
+                        except NoSuchElementException:
+                            print("    [FAIL] No Submit Button")
+                            force_clear_overlays(driver)
 
                 except Exception as e:
                     err_msg = str(e).lower()
